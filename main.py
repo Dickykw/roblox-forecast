@@ -30,33 +30,38 @@ INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 # Tuned on a rolling backtest (19 cuts, 169 reads, official log-score
-# rule with the unnamed-share): pooled -36.55 vs -36.89 for v3 (+0.34,
-# paired t=+6.69); 5-cut average -36.55 vs -36.83 (+0.27).  The house
-# persistence baseline scores -45.02 on the same 5 cuts.  v4 adds one
-# thing v3 lacked: spread that grows with place (SD_PLACE 0.07 — the top
-# places are more predictable, so their distributions are tighter), plus
-# a joint re-tune (SD0 2.0 -> 1.5, MIN_P 0.005 -> 0.012, PLAY_BETA 7.5
-# -> 12.5, VEL2_W 0.25 -> 0.35, LOOKBACK_H 36 -> 30, VEL_CLAMP 2.5 ->
-# 2.0).  Split-half gains are positive on both halves (+0.39 early,
-# +0.29 late); 13 of 19 cuts improve.  v3's playing-growth nudge,
-# velocity blend, per-place cap and displacement spread are unchanged.
+# rule with the unnamed-share): pooled -36.38 vs -36.55 for v4 (+0.17,
+# paired t=+5.09); 5-cut average -36.23 vs -36.55 (+0.33).  The house
+# persistence baseline scores -45.02 on the same 5 cuts.  v5 adds four
+# things v4 lacked: a coarser time grid (TIME_STEP 2 -> 14 — the average
+# over the window is taken at 0, 14, ..., 70, which reweights the sharp
+# early-time distributions against the diffuse late ones), a wider
+# per-place spread (SD_PLACE 0.07 -> 0.13), uniform velocity-fit weights
+# (the whole 30h window counts equally instead of a linear recency
+# ramp), and a slower spread growth (SD_RATE 0.35 -> 0.30).  Split-half gains are positive on both halves (+0.19 early,
+# +0.15 late); 13 of 19 cuts improve.  v4's per-place spread, joint
+# re-tune, playing-growth nudge, velocity blend, per-place cap and
+# displacement spread are unchanged.  Rejected in v5 screening: horizon
+# caps (24/36/48/60h, all worse on rolling), exponential time weights,
+# sd caps, shorter playing-growth windows (badly negative), playing
+# growth from a linear fit, and exponential velocity weights.
 LOOKBACK_H = 30.0        # rank-velocity fit window (hours)
 VEL_CLAMP = 2.0          # max |rank velocity|, ranks/hour
 VEL_HALFLIFE_H = 12.0    # velocity decays with this half-life
 SD0 = 1.5                # base rank standard deviation
-SD_RATE = 0.35           # sd grows per sqrt(hour)
+SD_RATE = 0.30           # sd grows per sqrt(hour)
 MAX_PER_PLACE = 40       # games named per place
 PLACE_CAP = 0.8          # named probability mass per place (rest unnamed)
 MIN_P = 0.012            # drop rows below this
 VISITS_BETA = 20.0       # rank-velocity nudge per unit of excess log-visits growth/hour
 CANDIDATE_TOP_N = 50     # games from the last snapshot considered as candidates
-TIME_STEP = 2            # hours between the averaged future times
+TIME_STEP = 14           # hours between the averaged future times
 CAP_SLOPE = -0.01        # per-place cap slope: cap_k = PLACE_CAP + CAP_SLOPE*(k-1)
 VEL2_W = 0.35            # weight of the short-lookback velocity blend
 LOOKBACK2_H = 12.0       # short lookback for the velocity blend (hours)
 PLAY_BETA = 12.5         # rank-velocity nudge per unit of excess log-playing growth/hour
 SD_DISP = 0.05           # extra sd per rank of |displacement|
-SD_PLACE = 0.07          # extra sd per place index (0 = same spread everywhere)
+SD_PLACE = 0.13          # extra sd per place index (0 = same spread everywhere)
 
 
 def parse_time(s):
@@ -131,12 +136,14 @@ def visits_growth(visits_u, t0, lookback_h):
 
 
 def velocity(series_u, t0, lookback_h):
-    """Weighted linear fit of rank vs time over the recent window.
-    Returns (rank velocity in ranks/hour (negative = rising), points used)."""
+    """Unweighted linear fit of rank vs time over the recent window.
+    Returns (rank velocity in ranks/hour (negative = rising), points used).
+    Uniform weights beat the v4 linear recency ramp (+0.03 rolling): the
+    whole 30h window counts equally, so the fit is less noisy."""
     pts = [(t, r) for (t, r) in series_u if t0 - t <= lookback_h and t <= t0]
     if len(pts) < 2:
         return 0.0, len(pts)
-    ws = [1.0 + 2.0 * (t - (t0 - lookback_h)) / lookback_h for (t, _) in pts]
+    ws = [1.0 for (t, _) in pts]
     sw = sum(ws)
     mt = sum(w * t for w, (t, _) in zip(ws, pts)) / sw
     mr = sum(w * r for w, (_, r) in zip(ws, pts)) / sw

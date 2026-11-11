@@ -40,8 +40,14 @@ Three more adjustments are always on:
   more named probability mass (cap falls 0.01 per place), and a game's
   spread grows with how far its drift has carried it from its last rank.
 - **Per-place spread:** each place's distribution widens with place
-  index (sd +0.07 per place), because the top places are more
+  index (sd +0.13 per place), because the top places are more
   predictable than the lower ones.
+- **Coarse time grid:** the window average is taken every 14 hours
+  (0, 14, ..., 70) instead of every 2 hours, which reweights the sharp
+  early-time distributions against the diffuse late ones.
+- **Uniform velocity weights:** the rank-velocity fit weights every
+  point in the 30-hour window equally instead of a linear recency ramp,
+  so the fit is less noisy.
 
 Probabilities are spread over many games per place — the log score
 punishes a confident-but-wrong pick far more than it rewards a confident
@@ -49,10 +55,12 @@ right one — and a share is left unnamed for games that join the chart
 after the history ends.
 
 Backtested on the practice history with the official log-score rule
-(rolling origin, 19 cuts, 169 reads): pooled -36.55 vs -36.89 for v3
-(+0.34, paired t=+6.69); 5-cut average -36.55 vs -36.83 (+0.27). The
-house persistence baseline scores -45.02 on the same 5 cuts. v3 had
-already improved v2 from -37.16 pooled / -37.31 5-cut.
+(rolling origin, 19 cuts, 169 reads): pooled -36.38 vs -36.55 for v4
+(+0.17, paired t=+5.09); 5-cut average -36.23 vs -36.55 (+0.33).
+Split-half gains are positive on both halves (+0.19 early, +0.15
+late); 13 of 19 cuts improve. The house persistence baseline scores
+-45.02 on the same 5 cuts. v4 had already improved v3 from -36.89
+pooled / -36.83 5-cut.
 
 ## Run it
 
