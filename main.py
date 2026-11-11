@@ -30,33 +30,33 @@ INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 # Tuned on a rolling backtest (19 cuts, 169 reads, official log-score
-# rule with the unnamed-share): pooled -36.89 vs -37.16 for v2 (+0.27,
-# paired t=+3.81); 5-cut average -36.83 vs -37.31 (+0.48).  The house
-# persistence baseline scores -45.02 on the same 5 cuts.  v3 adds three
-# things v2 lacked: a playing-count growth nudge (playing is in every
-# read, unlike visits), a short-lookback velocity blend (25% weight on a
-# 12h fit), a per-place cap that gives the top places slightly more
-# named mass, and spread that grows with |displacement|.  Biggest single
-# gain in v2: candidates widened from the top 10 to the top 50 games at
-# the cut (over a 72h window most top-10 slots come from outside the
-# current top 10); the drift displacement is the integral of the decaying
-# velocity, so a rising game stays risen.
-LOOKBACK_H = 36.0        # rank-velocity fit window (hours)
-VEL_CLAMP = 2.5          # max |rank velocity|, ranks/hour
+# rule with the unnamed-share): pooled -36.55 vs -36.89 for v3 (+0.34,
+# paired t=+6.69); 5-cut average -36.55 vs -36.83 (+0.27).  The house
+# persistence baseline scores -45.02 on the same 5 cuts.  v4 adds one
+# thing v3 lacked: spread that grows with place (SD_PLACE 0.07 — the top
+# places are more predictable, so their distributions are tighter), plus
+# a joint re-tune (SD0 2.0 -> 1.5, MIN_P 0.005 -> 0.012, PLAY_BETA 7.5
+# -> 12.5, VEL2_W 0.25 -> 0.35, LOOKBACK_H 36 -> 30, VEL_CLAMP 2.5 ->
+# 2.0).  Split-half gains are positive on both halves (+0.39 early,
+# +0.29 late); 13 of 19 cuts improve.  v3's playing-growth nudge,
+# velocity blend, per-place cap and displacement spread are unchanged.
+LOOKBACK_H = 30.0        # rank-velocity fit window (hours)
+VEL_CLAMP = 2.0          # max |rank velocity|, ranks/hour
 VEL_HALFLIFE_H = 12.0    # velocity decays with this half-life
-SD0 = 2.0                # base rank standard deviation
-SD_RATE = 0.4            # sd grows per sqrt(hour)
+SD0 = 1.5                # base rank standard deviation
+SD_RATE = 0.35           # sd grows per sqrt(hour)
 MAX_PER_PLACE = 40       # games named per place
 PLACE_CAP = 0.8          # named probability mass per place (rest unnamed)
-MIN_P = 0.005            # drop rows below this
+MIN_P = 0.012            # drop rows below this
 VISITS_BETA = 20.0       # rank-velocity nudge per unit of excess log-visits growth/hour
 CANDIDATE_TOP_N = 50     # games from the last snapshot considered as candidates
 TIME_STEP = 2            # hours between the averaged future times
 CAP_SLOPE = -0.01        # per-place cap slope: cap_k = PLACE_CAP + CAP_SLOPE*(k-1)
-VEL2_W = 0.25            # weight of the short-lookback velocity blend
+VEL2_W = 0.35            # weight of the short-lookback velocity blend
 LOOKBACK2_H = 12.0       # short lookback for the velocity blend (hours)
-PLAY_BETA = 7.5          # rank-velocity nudge per unit of excess log-playing growth/hour
+PLAY_BETA = 12.5         # rank-velocity nudge per unit of excess log-playing growth/hour
 SD_DISP = 0.05           # extra sd per rank of |displacement|
+SD_PLACE = 0.07          # extra sd per place index (0 = same spread everywhere)
 
 
 def parse_time(s):
@@ -213,7 +213,8 @@ def forecast(snaps, places, hours):
             # lands, so its spread grows with |displacement|.
             sd = SD0 + SD_RATE * math.sqrt(t + 1.0) + SD_DISP * abs(disp)
             for k in range(1, places + 1):
-                pr = norm_range(mu, sd, k - 0.5, k + 0.5)
+                sd_k = max(0.5, sd + SD_PLACE * (k - 1))
+                pr = norm_range(mu, sd_k, k - 0.5, k + 0.5)
                 if pr > 1e-5:
                     prob[k][u] = prob[k].get(u, 0.0) + pr
     for k in prob:
