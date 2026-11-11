@@ -29,15 +29,27 @@ reads carry them (the public archive's reads do not):
   than the median is nudged upward, bounded so it can never dominate the
   rank velocity.
 
+Three more adjustments are always on:
+
+- **Playing growth:** the same nudge, but from the playing counts in the
+  rank rows themselves, so this signal exists in every read.
+- **Velocity blend:** the rank velocity blends a 36-hour fit (75%) with
+  a 12-hour fit (25%), so recent surges count without letting the noisy
+  short fit dominate.
+- **Per-place cap and displacement spread:** the top places keep slightly
+  more named probability mass (cap falls 0.01 per place), and a game's
+  spread grows with how far its drift has carried it from its last rank.
+
 Probabilities are spread over many games per place — the log score
 punishes a confident-but-wrong pick far more than it rewards a confident
 right one — and a share is left unnamed for games that join the chart
 after the history ends.
 
 Backtested on the practice history with the official log-score rule
-(rolling origin, 19 cuts, 169 reads): pooled -37.16 vs -39.01 for the
-first entry (+1.84, paired t=+8.35); 5-cut average -37.31 vs -38.04. The
-house persistence baseline scores -45.02 on the same 5 cuts.
+(rolling origin, 19 cuts, 169 reads): pooled -36.89 vs -37.16 for v2
+(+0.27, paired t=+3.81); 5-cut average -36.83 vs -37.31 (+0.48). The
+house persistence baseline scores -45.02 on the same 5 cuts. v2 had
+already improved the first entry from -39.01 pooled / -38.04 5-cut.
 
 ## Run it
 

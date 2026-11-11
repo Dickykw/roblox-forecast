@@ -30,10 +30,14 @@ INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 # Tuned on a rolling backtest (19 cuts, 169 reads, official log-score
-# rule with the unnamed-share): pooled -37.16 vs -39.01 for the original
-# entry (+1.84, paired t=+8.35); 5-cut average -37.31 vs -38.04.  The
-# house persistence baseline scores -45.02 on the same 5 cuts.  Biggest
-# single gain: candidates widened from the top 10 to the top 50 games at
+# rule with the unnamed-share): pooled -36.89 vs -37.16 for v2 (+0.27,
+# paired t=+3.81); 5-cut average -36.83 vs -37.31 (+0.48).  The house
+# persistence baseline scores -45.02 on the same 5 cuts.  v3 adds three
+# things v2 lacked: a playing-count growth nudge (playing is in every
+# read, unlike visits), a short-lookback velocity blend (25% weight on a
+# 12h fit), a per-place cap that gives the top places slightly more
+# named mass, and spread that grows with |displacement|.  Biggest single
+# gain in v2: candidates widened from the top 10 to the top 50 games at
 # the cut (over a 72h window most top-10 slots come from outside the
 # current top 10); the drift displacement is the integral of the decaying
 # velocity, so a rising game stays risen.
@@ -47,6 +51,12 @@ PLACE_CAP = 0.8          # named probability mass per place (rest unnamed)
 MIN_P = 0.005            # drop rows below this
 VISITS_BETA = 20.0       # rank-velocity nudge per unit of excess log-visits growth/hour
 CANDIDATE_TOP_N = 50     # games from the last snapshot considered as candidates
+TIME_STEP = 2            # hours between the averaged future times
+CAP_SLOPE = -0.01        # per-place cap slope: cap_k = PLACE_CAP + CAP_SLOPE*(k-1)
+VEL2_W = 0.25            # weight of the short-lookback velocity blend
+LOOKBACK2_H = 12.0       # short lookback for the velocity blend (hours)
+PLAY_BETA = 7.5          # rank-velocity nudge per unit of excess log-playing growth/hour
+SD_DISP = 0.05           # extra sd per rank of |displacement|
 
 
 def parse_time(s):
@@ -65,15 +75,24 @@ def build_series(snaps):
     """Per universe_id: list of (hours_since_first, rank) sorted by time.
     Also collects, when the history carries details (the house recorder's
     reads do; the public archive's do not): the game's creation time and
-    its visits series, for the age-out and visits-growth adjustments."""
+    its visits series, for the age-out and visits-growth adjustments.
+    Playing counts come from the rank rows themselves, so the playing
+    series exists for every game in every read."""
     t_ref = parse_time(snaps[0]["at"])
     series = {}
     created = {}
     visits = {}
+    playing = {}
     for s in snaps:
         th = (parse_time(s["at"]) - t_ref).total_seconds() / 3600.0
         for r in s["up_and_coming"]:
             series.setdefault(r["universe_id"], []).append((th, r["rank"]))
+            if r.get("playing") is not None:
+                try:
+                    playing.setdefault(r["universe_id"], []).append(
+                        (th, float(r["playing"])))
+                except (TypeError, ValueError):
+                    pass
         details = s.get("details") or {}
         for key, d in details.items():
             try:
@@ -92,12 +111,12 @@ def build_series(snaps):
                     visits.setdefault(u, []).append((th, float(d["visits"])))
                 except (TypeError, ValueError):
                     pass
-    return series, t_ref, created, visits
+    return series, t_ref, created, visits, playing
 
 
-def visits_growth(visits_u, t0, lookback_h):
-    """Log-visits growth per hour over the recent window, or None."""
-    pts = [(t, v) for (t, v) in visits_u if t0 - t <= lookback_h and t <= t0 and v > 0]
+def log_growth(pts_u, t0, lookback_h):
+    """Log-count growth per hour over the recent window, or None."""
+    pts = [(t, v) for (t, v) in pts_u if t0 - t <= lookback_h and t <= t0 and v > 0]
     if len(pts) < 2:
         return None
     (t1, v1), (t2, v2) = pts[0], pts[-1]
@@ -106,12 +125,17 @@ def visits_growth(visits_u, t0, lookback_h):
     return (math.log(v2) - math.log(v1)) / (t2 - t1)
 
 
+def visits_growth(visits_u, t0, lookback_h):
+    """Log-visits growth per hour over the recent window, or None."""
+    return log_growth(visits_u, t0, lookback_h)
+
+
 def velocity(series_u, t0, lookback_h):
     """Weighted linear fit of rank vs time over the recent window.
-    Returns the rank velocity in ranks/hour (negative = rising)."""
+    Returns (rank velocity in ranks/hour (negative = rising), points used)."""
     pts = [(t, r) for (t, r) in series_u if t0 - t <= lookback_h and t <= t0]
     if len(pts) < 2:
-        return 0.0
+        return 0.0, len(pts)
     ws = [1.0 + 2.0 * (t - (t0 - lookback_h)) / lookback_h for (t, _) in pts]
     sw = sum(ws)
     mt = sum(w * t for w, (t, _) in zip(ws, pts)) / sw
@@ -119,18 +143,25 @@ def velocity(series_u, t0, lookback_h):
     num = sum(w * (t - mt) * (r - mr) for w, (t, r) in zip(ws, pts))
     den = sum(w * (t - mt) ** 2 for w, (t, _) in zip(ws, pts))
     vel = num / den if den > 1e-9 else 0.0
-    return max(-VEL_CLAMP, min(VEL_CLAMP, vel))
+    return max(-VEL_CLAMP, min(VEL_CLAMP, vel)), len(pts)
 
 
 def forecast(snaps, places, hours):
-    series, t_ref, created, visits = build_series(snaps)
+    series, t_ref, created, visits, playing = build_series(snaps)
     t0 = (parse_time(snaps[-1]["at"]) - t_ref).total_seconds() / 3600.0
     t0_abs = parse_time(snaps[-1]["at"])
     last = sorted(snaps[-1]["up_and_coming"], key=lambda r: r["rank"])
     cand = last[:CANDIDATE_TOP_N]
     last_ids = [r["universe_id"] for r in cand]
     r0 = {r["universe_id"]: r["rank"] for r in cand}
-    vel = {u: velocity(series.get(u, []), t0, LOOKBACK_H) for u in last_ids}
+    vel = {}
+    for u in last_ids:
+        v, _ = velocity(series.get(u, []), t0, LOOKBACK_H)
+        # Blend in a short-lookback velocity: recent surges matter more
+        # than a 36h average alone shows, but the short fit is noisier,
+        # so it only gets a quarter of the weight.
+        v2, _ = velocity(series.get(u, []), t0, LOOKBACK2_H)
+        vel[u] = max(-VEL_CLAMP, min(VEL_CLAMP, (1.0 - VEL2_W) * v + VEL2_W * v2))
     # Visits growth nudge (only when details exist): the chart is sorted by
     # user growth, and visits growth is the closest observable proxy.  A
     # game whose visits grow faster than the median is nudged upward
@@ -144,6 +175,17 @@ def forecast(snaps, places, hours):
             if growth[u] is not None:
                 adj = -VISITS_BETA * (growth[u] - med)
                 vel[u] = max(-VEL_CLAMP, min(VEL_CLAMP, vel[u] + adj))
+    # Playing-count growth nudge: same idea, but playing counts are in
+    # the rank rows themselves, so this signal exists in every read.
+    pgrowth = {u: log_growth(playing.get(u, []), t0, LOOKBACK_H)
+               for u in last_ids}
+    phave = [g for g in pgrowth.values() if g is not None]
+    if phave:
+        pmed = statistics.median(phave)
+        for u in last_ids:
+            if pgrowth[u] is not None:
+                adj = -PLAY_BETA * (pgrowth[u] - pmed)
+                vel[u] = max(-VEL_CLAMP, min(VEL_CLAMP, vel[u] + adj))
     # Age-out: the chart only lists games published within the last 28
     # days.  A game whose created date + 28 days falls inside the window
     # leaves the chart then, so it gets no probability past that hour.
@@ -153,9 +195,9 @@ def forecast(snaps, places, hours):
             eh = (created[u] + timedelta(days=28) - t0_abs).total_seconds() / 3600.0
             exit_h[u] = eh if eh > 0 else 0.0
 
-    # Average P(game at place k) over the window's hours (every 2nd hour).
+    # Average P(game at place k) over the window's hours.
     prob = {k: {} for k in range(1, places + 1)}
-    times = list(range(0, hours + 1, 2))
+    times = list(range(0, hours + 1, TIME_STEP))
     for t in times:
         decay = 0.5 ** (t / VEL_HALFLIFE_H)
         for u in last_ids:
@@ -164,9 +206,12 @@ def forecast(snaps, places, hours):
             # Displacement is the integral of the exponentially decaying
             # velocity: it saturates at vel*halflife/ln2 instead of
             # returning to zero, so a rising game stays risen.
-            mu = r0[u] + vel[u] * (VEL_HALFLIFE_H / math.log(2.0)) * (1.0 - decay)
+            disp = vel[u] * (VEL_HALFLIFE_H / math.log(2.0)) * (1.0 - decay)
+            mu = r0[u] + disp
             mu = max(1.0, min(120.0, mu))
-            sd = SD0 + SD_RATE * math.sqrt(t + 1.0)
+            # A game that has moved far is less certain about where it
+            # lands, so its spread grows with |displacement|.
+            sd = SD0 + SD_RATE * math.sqrt(t + 1.0) + SD_DISP * abs(disp)
             for k in range(1, places + 1):
                 pr = norm_range(mu, sd, k - 0.5, k + 0.5)
                 if pr > 1e-5:
@@ -182,7 +227,9 @@ def forecast(snaps, places, hours):
         if not items:
             continue
         s = sum(v for _, v in items)
-        scale = min(1.0, PLACE_CAP / s) if s > 0 else 0.0
+        cap_k = PLACE_CAP + CAP_SLOPE * (k - 1)
+        cap_k = max(0.3, min(1.0, cap_k))
+        scale = min(1.0, cap_k / s) if s > 0 else 0.0
         for u, v in items:
             rows.append({"universe_id": u, "place": k, "p": round(v * scale, 6)})
 
