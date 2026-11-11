@@ -11,7 +11,12 @@ decaying with time) plus diffusion (rank uncertainty growing with sqrt(t)).
 For every future hour of the scored window the program computes P(game at
 place k) from a Normal rank distribution and averages over the window, so
 the forecast is the time-averaged probability that each game holds each
-place.
+place. The drift displacement is the integral of the decaying velocity,
+so a rising game stays risen instead of drifting back.
+
+The candidate pool is the top 50 games at the cut, not just the top 10:
+over a 72-hour window most top-10 slots come from outside the current
+top 10, so the model follows rising games from deeper in the chart.
 
 Two adjustments use the history's `details` when the house recorder's
 reads carry them (the public archive's reads do not):
@@ -29,10 +34,10 @@ punishes a confident-but-wrong pick far more than it rewards a confident
 right one — and a share is left unnamed for games that join the chart
 after the history ends.
 
-Backtested on the practice history (splits at snapshots 20/24/28, scored
-with the official log-score rule against the later reads), the model beat
-the house persistence baseline by about 10 log-score points on average
-(-38.8 vs about -49).
+Backtested on the practice history with the official log-score rule
+(rolling origin, 19 cuts, 169 reads): pooled -37.16 vs -39.01 for the
+first entry (+1.84, paired t=+8.35); 5-cut average -37.31 vs -38.04. The
+house persistence baseline scores -45.02 on the same 5 cuts.
 
 ## Run it
 

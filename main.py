@@ -29,18 +29,24 @@ from datetime import datetime, timedelta
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-# Tuned on backtests (history splits at snapshots 20/24/28, scored with
-# the official log-score rule against the later reads): the model beat the
-# house persistence baseline by ~10 log-score points on average.
-LOOKBACK_H = 48.0        # rank-velocity fit window (hours)
+# Tuned on a rolling backtest (19 cuts, 169 reads, official log-score
+# rule with the unnamed-share): pooled -37.16 vs -39.01 for the original
+# entry (+1.84, paired t=+8.35); 5-cut average -37.31 vs -38.04.  The
+# house persistence baseline scores -45.02 on the same 5 cuts.  Biggest
+# single gain: candidates widened from the top 10 to the top 50 games at
+# the cut (over a 72h window most top-10 slots come from outside the
+# current top 10); the drift displacement is the integral of the decaying
+# velocity, so a rising game stays risen.
+LOOKBACK_H = 36.0        # rank-velocity fit window (hours)
 VEL_CLAMP = 2.5          # max |rank velocity|, ranks/hour
-VEL_HALFLIFE_H = 48.0    # velocity decays with this half-life
-SD0 = 2.5                # base rank standard deviation
-SD_RATE = 0.6            # sd grows per sqrt(hour)
+VEL_HALFLIFE_H = 12.0    # velocity decays with this half-life
+SD0 = 2.0                # base rank standard deviation
+SD_RATE = 0.4            # sd grows per sqrt(hour)
 MAX_PER_PLACE = 40       # games named per place
-PLACE_CAP = 0.7          # named probability mass per place (rest unnamed)
-MIN_P = 0.001            # drop rows below this
+PLACE_CAP = 0.8          # named probability mass per place (rest unnamed)
+MIN_P = 0.005            # drop rows below this
 VISITS_BETA = 20.0       # rank-velocity nudge per unit of excess log-visits growth/hour
+CANDIDATE_TOP_N = 50     # games from the last snapshot considered as candidates
 
 
 def parse_time(s):
@@ -121,8 +127,9 @@ def forecast(snaps, places, hours):
     t0 = (parse_time(snaps[-1]["at"]) - t_ref).total_seconds() / 3600.0
     t0_abs = parse_time(snaps[-1]["at"])
     last = sorted(snaps[-1]["up_and_coming"], key=lambda r: r["rank"])
-    last_ids = [r["universe_id"] for r in last]
-    r0 = {r["universe_id"]: r["rank"] for r in last}
+    cand = last[:CANDIDATE_TOP_N]
+    last_ids = [r["universe_id"] for r in cand]
+    r0 = {r["universe_id"]: r["rank"] for r in cand}
     vel = {u: velocity(series.get(u, []), t0, LOOKBACK_H) for u in last_ids}
     # Visits growth nudge (only when details exist): the chart is sorted by
     # user growth, and visits growth is the closest observable proxy.  A
@@ -154,7 +161,10 @@ def forecast(snaps, places, hours):
         for u in last_ids:
             if u in exit_h and t >= exit_h[u]:
                 continue
-            mu = r0[u] + vel[u] * t * decay
+            # Displacement is the integral of the exponentially decaying
+            # velocity: it saturates at vel*halflife/ln2 instead of
+            # returning to zero, so a rising game stays risen.
+            mu = r0[u] + vel[u] * (VEL_HALFLIFE_H / math.log(2.0)) * (1.0 - decay)
             mu = max(1.0, min(120.0, mu))
             sd = SD0 + SD_RATE * math.sqrt(t + 1.0)
             for k in range(1, places + 1):
