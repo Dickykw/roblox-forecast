@@ -1,280 +1,348 @@
-#!/usr/bin/env python3
-"""Predict Roblox's Up-and-Coming top 10 — make.fun bounty entry.
-
-Reads the chart history at $MAKEFUN_INPUT_DIR (else /input) and writes
-/output/forecast.json ($MAKEFUN_OUTPUT_DIR when set): for each of the top
-10 places, a probability for each game named being at that place, plus
-the top 10 in order.
-
-Method: rank dynamics.  Each game's rank is modelled as a damped drift
-(its recent rank velocity, decaying with time) plus diffusion (rank
-uncertainty growing with sqrt(t)).  For every future hour of the scored
-window we compute P(game at place k) from a Normal rank distribution and
-average over the window, so the forecast is the time-averaged probability
-that each game holds each place.  Probabilities are spread over many
-games per place — the log score punishes a confident-but-wrong pick far
-more than it rewards a confident right one — and a share is left unnamed
-for games that join the chart after the history ends.
-
-Standard library only, no network, deterministic: the same input always
-produces the same bytes.
+"""
+Forecast the Roblox Up-and-Coming chart using a damped drift-diffusion model.
+Reads chart history from MAKEFUN_INPUT_DIR (default /input) and writes a forecast
+JSON to MAKEFUN_OUTPUT_DIR (default /output). Backtest: rolling pooled -36.38 vs
+-36.55 previous, 5-cut average -36.23 vs -36.55, 13 of 19 cuts improving.
 """
 
+import os
 import json
 import math
-import os
-import statistics
-from datetime import datetime, timedelta
+from datetime import datetime
+from pathlib import Path
+
+
+LOOKBACK_H = 30.0
+VEL_CLAMP = 2.0
+VEL_HALFLIFE_H = 12.0
+SD0 = 1.5
+SD_RATE = 0.30
+MAX_PER_PLACE = 40
+PLACE_CAP = 0.8
+MIN_P = 0.012
+VISITS_BETA = 20.0
+CANDIDATE_TOP_N = 50
+TIME_STEP = 14
+CAP_SLOPE = -0.01
+VEL2_W = 0.35
+LOOKBACK2_H = 12.0
+PLAY_BETA = 12.5
+SD_DISP = 0.05
+SD_PLACE = 0.13
 
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-# Tuned on a rolling backtest (19 cuts, 169 reads, official log-score
-# rule with the unnamed-share): pooled -36.38 vs -36.55 for v4 (+0.17,
-# paired t=+5.09); 5-cut average -36.23 vs -36.55 (+0.33).  The house
-# persistence baseline scores -45.02 on the same 5 cuts.  v5 adds four
-# things v4 lacked: a coarser time grid (TIME_STEP 2 -> 14 — the average
-# over the window is taken at 0, 14, ..., 70, which reweights the sharp
-# early-time distributions against the diffuse late ones), a wider
-# per-place spread (SD_PLACE 0.07 -> 0.13), uniform velocity-fit weights
-# (the whole 30h window counts equally instead of a linear recency
-# ramp), and a slower spread growth (SD_RATE 0.35 -> 0.30).  Split-half gains are positive on both halves (+0.19 early,
-# +0.15 late); 13 of 19 cuts improve.  v4's per-place spread, joint
-# re-tune, playing-growth nudge, velocity blend, per-place cap and
-# displacement spread are unchanged.  Rejected in v5 screening: horizon
-# caps (24/36/48/60h, all worse on rolling), exponential time weights,
-# sd caps, shorter playing-growth windows (badly negative), playing
-# growth from a linear fit, and exponential velocity weights.
-LOOKBACK_H = 30.0        # rank-velocity fit window (hours)
-VEL_CLAMP = 2.0          # max |rank velocity|, ranks/hour
-VEL_HALFLIFE_H = 12.0    # velocity decays with this half-life
-SD0 = 1.5                # base rank standard deviation
-SD_RATE = 0.30           # sd grows per sqrt(hour)
-MAX_PER_PLACE = 40       # games named per place
-PLACE_CAP = 0.8          # named probability mass per place (rest unnamed)
-MIN_P = 0.012            # drop rows below this
-VISITS_BETA = 20.0       # rank-velocity nudge per unit of excess log-visits growth/hour
-CANDIDATE_TOP_N = 50     # games from the last snapshot considered as candidates
-TIME_STEP = 14           # hours between the averaged future times
-CAP_SLOPE = -0.01        # per-place cap slope: cap_k = PLACE_CAP + CAP_SLOPE*(k-1)
-VEL2_W = 0.35            # weight of the short-lookback velocity blend
-LOOKBACK2_H = 12.0       # short lookback for the velocity blend (hours)
-PLAY_BETA = 12.5         # rank-velocity nudge per unit of excess log-playing growth/hour
-SD_DISP = 0.05           # extra sd per rank of |displacement|
-SD_PLACE = 0.13          # extra sd per place index (0 = same spread everywhere)
+
+def parse_time(s: str) -> datetime:
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
 
 
-def parse_time(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
-def phi(x):
+def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def norm_range(mu, sd, lo, hi):
-    return phi((hi - mu) / sd) - phi((lo - mu) / sd)
+def interval_prob(mean: float, sd: float, lo: float, hi: float) -> float:
+    if sd <= 0.0:
+        return 0.0
+    z_lo = (lo - mean) / sd
+    z_hi = (hi - mean) / sd
+    return norm_cdf(z_hi) - norm_cdf(z_lo)
 
 
-def build_series(snaps):
-    """Per universe_id: list of (hours_since_first, rank) sorted by time.
-    Also collects, when the history carries details (the house recorder's
-    reads do; the public archive's do not): the game's creation time and
-    its visits series, for the age-out and visits-growth adjustments.
-    Playing counts come from the rank rows themselves, so the playing
-    series exists for every game in every read."""
-    t_ref = parse_time(snaps[0]["at"])
-    series = {}
-    created = {}
-    visits = {}
-    playing = {}
-    for s in snaps:
-        th = (parse_time(s["at"]) - t_ref).total_seconds() / 3600.0
-        for r in s["up_and_coming"]:
-            series.setdefault(r["universe_id"], []).append((th, r["rank"]))
-            if r.get("playing") is not None:
+def build_series(reads):
+    ref_time = parse_time(reads[0]["at"])
+    rank_series = {}
+    playing_series = {}
+    creation_map = {}
+    visits_series = {}
+
+    for read in reads:
+        read_time = parse_time(read["at"])
+        offset_h = (read_time - ref_time).total_seconds() / 3600.0
+
+        for row in read["up_and_coming"]:
+            gid = int(row["universe_id"])
+            rank = int(row["rank"])
+            rank_series.setdefault(gid, []).append((offset_h, rank))
+
+            playing_val = row.get("playing")
+            if playing_val is not None:
                 try:
-                    playing.setdefault(r["universe_id"], []).append(
-                        (th, float(r["playing"])))
-                except (TypeError, ValueError):
+                    pval = float(playing_val)
+                    if pval > 0:
+                        playing_series.setdefault(gid, []).append((offset_h, pval))
+                except (ValueError, TypeError):
                     pass
-        details = s.get("details") or {}
-        for key, d in details.items():
+
+        details = read.get("details") or {}
+        for k, v in details.items():
             try:
-                u = int(key)
-            except (TypeError, ValueError):
+                gid = int(k)
+            except (ValueError, TypeError):
                 continue
-            if not isinstance(d, dict):
-                continue
-            if d.get("created") and u not in created:
+            if gid not in creation_map:
+                created_str = v.get("created")
+                if created_str:
+                    try:
+                        creation_map[gid] = parse_time(created_str)
+                    except (ValueError, TypeError):
+                        pass
+            visits_val = v.get("visits")
+            if visits_val is not None:
                 try:
-                    created[u] = parse_time(d["created"])
-                except (TypeError, ValueError):
+                    vval = float(visits_val)
+                    if vval > 0:
+                        visits_series.setdefault(gid, []).append((offset_h, vval))
+                except (ValueError, TypeError):
                     pass
-            if d.get("visits") is not None:
-                try:
-                    visits.setdefault(u, []).append((th, float(d["visits"])))
-                except (TypeError, ValueError):
-                    pass
-    return series, t_ref, created, visits, playing
+
+    return rank_series, ref_time, creation_map, visits_series, playing_series
 
 
-def log_growth(pts_u, t0, lookback_h):
-    """Log-count growth per hour over the recent window, or None."""
-    pts = [(t, v) for (t, v) in pts_u if t0 - t <= lookback_h and t <= t0 and v > 0]
-    if len(pts) < 2:
+def log_growth(points, ref_offset, lookback_h):
+    kept = []
+    for t, val in points:
+        if ref_offset - t <= lookback_h and t <= ref_offset:
+            kept.append((t, val))
+    if len(kept) < 2:
         return None
-    (t1, v1), (t2, v2) = pts[0], pts[-1]
-    if t2 - t1 < 1.0:
+    t0, v0 = kept[0]
+    t1, v1 = kept[-1]
+    if t1 - t0 < 1.0:
         return None
-    return (math.log(v2) - math.log(v1)) / (t2 - t1)
+    return (math.log(v1) - math.log(v0)) / (t1 - t0)
 
 
-def visits_growth(visits_u, t0, lookback_h):
-    """Log-visits growth per hour over the recent window, or None."""
-    return log_growth(visits_u, t0, lookback_h)
+def visits_growth(visits_series, gid, ref_offset, lookback_h):
+    pts = visits_series.get(gid, [])
+    return log_growth(pts, ref_offset, lookback_h)
 
 
-def velocity(series_u, t0, lookback_h):
-    """Unweighted linear fit of rank vs time over the recent window.
-    Returns (rank velocity in ranks/hour (negative = rising), points used).
-    Uniform weights beat the v4 linear recency ramp (+0.03 rolling): the
-    whole 30h window counts equally, so the fit is less noisy."""
-    pts = [(t, r) for (t, r) in series_u if t0 - t <= lookback_h and t <= t0]
-    if len(pts) < 2:
-        return 0.0, len(pts)
-    ws = [1.0 for (t, _) in pts]
-    sw = sum(ws)
-    mt = sum(w * t for w, (t, _) in zip(ws, pts)) / sw
-    mr = sum(w * r for w, (_, r) in zip(ws, pts)) / sw
-    num = sum(w * (t - mt) * (r - mr) for w, (t, r) in zip(ws, pts))
-    den = sum(w * (t - mt) ** 2 for w, (t, _) in zip(ws, pts))
-    vel = num / den if den > 1e-9 else 0.0
-    return max(-VEL_CLAMP, min(VEL_CLAMP, vel)), len(pts)
+def velocity(rank_series, gid, ref_offset, lookback_h):
+    pts = rank_series.get(gid, [])
+    kept = []
+    for t, r in pts:
+        if ref_offset - t <= lookback_h and t <= ref_offset:
+            kept.append((t, r))
+    if len(kept) < 2:
+        return 0.0, len(kept)
+    n = len(kept)
+    sum_t = sum(t for t, _ in kept)
+    sum_r = sum(r for _, r in kept)
+    mean_t = sum_t / n
+    mean_r = sum_r / n
+    num = sum((t - mean_t) * (r - mean_r) for t, r in kept)
+    den = sum((t - mean_t) ** 2 for t, _ in kept)
+    if den <= 1e-9:
+        slope = 0.0
+    else:
+        slope = num / den
+    if slope > VEL_CLAMP:
+        slope = VEL_CLAMP
+    elif slope < -VEL_CLAMP:
+        slope = -VEL_CLAMP
+    return slope, n
 
 
-def forecast(snaps, places, hours):
-    series, t_ref, created, visits, playing = build_series(snaps)
-    t0 = (parse_time(snaps[-1]["at"]) - t_ref).total_seconds() / 3600.0
-    t0_abs = parse_time(snaps[-1]["at"])
-    last = sorted(snaps[-1]["up_and_coming"], key=lambda r: r["rank"])
-    cand = last[:CANDIDATE_TOP_N]
-    last_ids = [r["universe_id"] for r in cand]
-    r0 = {r["universe_id"]: r["rank"] for r in cand}
-    vel = {}
-    for u in last_ids:
-        v, _ = velocity(series.get(u, []), t0, LOOKBACK_H)
-        # Blend in a short-lookback velocity: recent surges matter more
-        # than a 36h average alone shows, but the short fit is noisier,
-        # so it only gets a quarter of the weight.
-        v2, _ = velocity(series.get(u, []), t0, LOOKBACK2_H)
-        vel[u] = max(-VEL_CLAMP, min(VEL_CLAMP, (1.0 - VEL2_W) * v + VEL2_W * v2))
-    # Visits growth nudge (only when details exist): the chart is sorted by
-    # user growth, and visits growth is the closest observable proxy.  A
-    # game whose visits grow faster than the median is nudged upward
-    # (negative rank velocity), bounded so it can never dominate the rank
-    # velocity the backtest validated.
-    growth = {u: visits_growth(visits.get(u, []), t0, LOOKBACK_H) for u in last_ids}
-    have = [g for g in growth.values() if g is not None]
-    if have:
-        med = statistics.median(have)
-        for u in last_ids:
-            if growth[u] is not None:
-                adj = -VISITS_BETA * (growth[u] - med)
-                vel[u] = max(-VEL_CLAMP, min(VEL_CLAMP, vel[u] + adj))
-    # Playing-count growth nudge: same idea, but playing counts are in
-    # the rank rows themselves, so this signal exists in every read.
-    pgrowth = {u: log_growth(playing.get(u, []), t0, LOOKBACK_H)
-               for u in last_ids}
-    phave = [g for g in pgrowth.values() if g is not None]
-    if phave:
-        pmed = statistics.median(phave)
-        for u in last_ids:
-            if pgrowth[u] is not None:
-                adj = -PLAY_BETA * (pgrowth[u] - pmed)
-                vel[u] = max(-VEL_CLAMP, min(VEL_CLAMP, vel[u] + adj))
-    # Age-out: the chart only lists games published within the last 28
-    # days.  A game whose created date + 28 days falls inside the window
-    # leaves the chart then, so it gets no probability past that hour.
-    exit_h = {}
-    for u in last_ids:
-        if u in created:
-            eh = (created[u] + timedelta(days=28) - t0_abs).total_seconds() / 3600.0
-            exit_h[u] = eh if eh > 0 else 0.0
+def forecast(reads, places, window_h):
+    rank_series, ref_time, creation_map, visits_series, playing_series = build_series(reads)
 
-    # Average P(game at place k) over the window's hours.
-    prob = {k: {} for k in range(1, places + 1)}
-    times = list(range(0, hours + 1, TIME_STEP))
-    for t in times:
+    last_read = reads[-1]
+    last_time = parse_time(last_read["at"])
+    ref_offset = (last_time - ref_time).total_seconds() / 3600.0
+
+    last_chart = last_read["up_and_coming"]
+    last_chart_sorted = sorted(last_chart, key=lambda r: int(r["rank"]))
+    candidates = last_chart_sorted[:CANDIDATE_TOP_N]
+    cand_ids = [int(r["universe_id"]) for r in candidates]
+    current_ranks = {int(r["universe_id"]): int(r["rank"]) for r in candidates}
+
+    long_vels = {}
+    short_vels = {}
+    for gid in cand_ids:
+        v_long, _ = velocity(rank_series, gid, ref_offset, LOOKBACK_H)
+        v_short, _ = velocity(rank_series, gid, ref_offset, LOOKBACK2_H)
+        long_vels[gid] = v_long
+        short_vels[gid] = v_short
+
+    blended_vels = {}
+    for gid in cand_ids:
+        v = (1.0 - VEL2_W) * long_vels[gid] + VEL2_W * short_vels[gid]
+        if v > VEL_CLAMP:
+            v = VEL_CLAMP
+        elif v < -VEL_CLAMP:
+            v = -VEL_CLAMP
+        blended_vels[gid] = v
+
+    visits_growths = {}
+    for gid in cand_ids:
+        g = visits_growth(visits_series, gid, ref_offset, LOOKBACK_H)
+        if g is not None:
+            visits_growths[gid] = g
+
+    if visits_growths:
+        vals = sorted(visits_growths.values())
+        m = len(vals)
+        if m % 2 == 1:
+            median_vg = vals[m // 2]
+        else:
+            median_vg = (vals[m // 2 - 1] + vals[m // 2]) / 2.0
+        for gid, g in visits_growths.items():
+            adj = blended_vels[gid] - VISITS_BETA * (g - median_vg)
+            if adj > VEL_CLAMP:
+                adj = VEL_CLAMP
+            elif adj < -VEL_CLAMP:
+                adj = -VEL_CLAMP
+            blended_vels[gid] = adj
+
+    playing_growths = {}
+    for gid in cand_ids:
+        pts = playing_series.get(gid, [])
+        g = log_growth(pts, ref_offset, LOOKBACK_H)
+        if g is not None:
+            playing_growths[gid] = g
+
+    if playing_growths:
+        vals = sorted(playing_growths.values())
+        m = len(vals)
+        if m % 2 == 1:
+            median_pg = vals[m // 2]
+        else:
+            median_pg = (vals[m // 2 - 1] + vals[m // 2]) / 2.0
+        for gid, g in playing_growths.items():
+            adj = blended_vels[gid] - PLAY_BETA * (g - median_pg)
+            if adj > VEL_CLAMP:
+                adj = VEL_CLAMP
+            elif adj < -VEL_CLAMP:
+                adj = -VEL_CLAMP
+            blended_vels[gid] = adj
+
+    age_out = {}
+    for gid in cand_ids:
+        created = creation_map.get(gid)
+        if created is not None:
+            delta_h = (created - last_time).total_seconds() / 3600.0 + 28 * 24
+            if delta_h < 0:
+                delta_h = 0.0
+            age_out[gid] = delta_h
+        else:
+            age_out[gid] = float("inf")
+
+    grid_times = []
+    t = 0
+    while t <= window_h + 1e-9:
+        grid_times.append(t)
+        t += TIME_STEP
+
+    n_grid = len(grid_times)
+    prob_accum = {p: {} for p in range(1, places + 1)}
+
+    for t in grid_times:
         decay = 0.5 ** (t / VEL_HALFLIFE_H)
-        for u in last_ids:
-            if u in exit_h and t >= exit_h[u]:
+        for gid in cand_ids:
+            if t > age_out.get(gid, float("inf")):
                 continue
-            # Displacement is the integral of the exponentially decaying
-            # velocity: it saturates at vel*halflife/ln2 instead of
-            # returning to zero, so a rising game stays risen.
-            disp = vel[u] * (VEL_HALFLIFE_H / math.log(2.0)) * (1.0 - decay)
-            mu = r0[u] + disp
-            mu = max(1.0, min(120.0, mu))
-            # A game that has moved far is less certain about where it
-            # lands, so its spread grows with |displacement|.
-            sd = SD0 + SD_RATE * math.sqrt(t + 1.0) + SD_DISP * abs(disp)
-            for k in range(1, places + 1):
-                sd_k = max(0.5, sd + SD_PLACE * (k - 1))
-                pr = norm_range(mu, sd_k, k - 0.5, k + 0.5)
-                if pr > 1e-5:
-                    prob[k][u] = prob[k].get(u, 0.0) + pr
-    for k in prob:
-        for u in prob[k]:
-            prob[k][u] /= len(times)
+            v = blended_vels[gid]
+            disp = v * (VEL_HALFLIFE_H / math.log(2.0)) * (1.0 - decay)
+            mean_rank = current_ranks[gid] + disp
+            if mean_rank < 1.0:
+                mean_rank = 1.0
+            elif mean_rank > 120.0:
+                mean_rank = 120.0
+            spread = SD0 + SD_RATE * math.sqrt(t + 1.0) + SD_DISP * abs(disp)
+            for p in range(1, places + 1):
+                place_spread = spread + SD_PLACE * (p - 1)
+                if place_spread < 0.5:
+                    place_spread = 0.5
+                prob = interval_prob(mean_rank, place_spread, p - 0.5, p + 0.5)
+                if prob > 1e-5:
+                    prob_accum[p][gid] = prob_accum[p].get(gid, 0.0) + prob
+
+    for p in range(1, places + 1):
+        for gid in prob_accum[p]:
+            prob_accum[p][gid] /= n_grid
 
     rows = []
-    for k in range(1, places + 1):
-        items = sorted(prob[k].items(), key=lambda kv: -kv[1])[:MAX_PER_PLACE]
-        items = [(u, v) for (u, v) in items if v >= MIN_P]
-        if not items:
+    for p in range(1, places + 1):
+        items = sorted(prob_accum[p].items(), key=lambda x: x[1], reverse=True)
+        kept = []
+        for gid, prob in items:
+            if prob >= MIN_P:
+                kept.append((gid, prob))
+            if len(kept) >= MAX_PER_PLACE:
+                break
+        if not kept:
             continue
-        s = sum(v for _, v in items)
-        cap_k = PLACE_CAP + CAP_SLOPE * (k - 1)
-        cap_k = max(0.3, min(1.0, cap_k))
-        scale = min(1.0, cap_k / s) if s > 0 else 0.0
-        for u, v in items:
-            rows.append({"universe_id": u, "place": k, "p": round(v * scale, 6)})
+        cap = PLACE_CAP + CAP_SLOPE * (p - 1)
+        if cap < 0.3:
+            cap = 0.3
+        elif cap > 1.0:
+            cap = 1.0
+        total = sum(prob for _, prob in kept)
+        scale = min(1.0, cap / total) if total > 0 else 0.0
+        for gid, prob in kept:
+            scaled = prob * scale
+            rows.append({
+                "universe_id": gid,
+                "place": p,
+                "p": round(scaled, 6)
+            })
 
-    # top10: order by expected place (probability-weighted), tie by now.
-    exp_rank = {}
-    for u in last_ids:
-        tot = sum(prob[k].get(u, 0.0) for k in range(1, places + 1))
-        exp_rank[u] = (
-            sum(k * prob[k].get(u, 0.0) for k in range(1, places + 1)) / tot
-            if tot > 0
-            else r0[u]
-        )
-    top10 = sorted(last_ids, key=lambda u: (exp_rank[u], r0[u]))[:places]
+    expected = {}
+    for gid in cand_ids:
+        num = 0.0
+        den = 0.0
+        for p in range(1, places + 1):
+            prob = prob_accum[p].get(gid, 0.0)
+            num += p * prob
+            den += prob
+        if den > 0:
+            expected[gid] = num / den
+        else:
+            expected[gid] = current_ranks[gid]
+
+    top10 = sorted(cand_ids, key=lambda g: (expected[g], current_ranks[g]))[:places]
+
     return {"probabilities": rows, "top10": top10}
 
 
 def main():
-    with open(os.path.join(INPUT_DIR, "task.json")) as f:
+    input_path = Path(INPUT_DIR)
+    task_path = input_path / "task.json"
+    history_path = input_path / "history.ndjson"
+
+    with open(task_path, "r") as f:
         task = json.load(f)
-    places = int(task.get("places", 10))
-    window = task.get("window", {})
-    hours = int(window.get("slots", 72))
-    output = task.get("output", "forecast.json")
-    snaps = []
-    with open(os.path.join(INPUT_DIR, "history.ndjson")) as f:
+
+    places = task.get("places", 10)
+    window_slots = task.get("window", {}).get("slots", 72)
+    output_name = task.get("output", "forecast.json")
+
+    reads = []
+    with open(history_path, "r") as f:
         for line in f:
             line = line.strip()
-            if line:
-                snaps.append(json.loads(line))
-    snaps.sort(key=lambda s: s["at"])
-    result = forecast(snaps, places, hours)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, output)
-    with open(out_path, "w") as f:
-        f.write(json.dumps(result) + "\n")
-    print(f"Wrote {out_path} ({os.path.getsize(out_path)} bytes, "
-          f"{len(result['probabilities'])} rows, top10={result['top10']})")
+            if not line:
+                continue
+            reads.append(json.loads(line))
+
+    reads.sort(key=lambda r: r["at"])
+
+    result = forecast(reads, places, window_slots)
+
+    output_path = Path(OUTPUT_DIR)
+    output_path.mkdir(parents=True, exist_ok=True)
+    out_file = output_path / output_name
+
+    out_text = json.dumps(result, separators=(",", ":")) + "\n"
+    out_file.write_text(out_text)
+
+    size = out_file.stat().st_size
+    row_count = len(result["probabilities"])
+    print(f"wrote {out_file} ({size} bytes, {row_count} rows, top10={result['top10']})")
 
 
 if __name__ == "__main__":

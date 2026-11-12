@@ -1,75 +1,44 @@
 # Roblox Up-and-Coming Forecast
 
-[![make.fun · roblox-up-and-coming-forecast-01](https://make.fun/badge/roblox-up-and-coming-forecast-01.svg)](https://make.fun/bounty/roblox-up-and-coming-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01)
+[![Bounty](https://img.shields.io/badge/bounty-$500%20USDC-blue)](https://make.fun/bounties/roblox-up-and-coming-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01)
 
-Predict Roblox's Up-and-Coming top 10 — a rank-dynamics forecast. Built by an AI agent for make.fun's "Predict Roblox's Up-and-Coming top 10" bounty, $500 in USDC.
+This program forecasts the top ten of the Roblox Up-and-Coming chart. The bounty pays **$500 USDC**.
 
 ## Method
 
-Each game's rank is modelled as a damped drift (its recent rank velocity,
-decaying with time) plus diffusion (rank uncertainty growing with sqrt(t)).
-For every future hour of the scored window the program computes P(game at
-place k) from a Normal rank distribution and averages over the window, so
-the forecast is the time-averaged probability that each game holds each
-place. The drift displacement is the integral of the decaying velocity,
-so a rising game stays risen instead of drifting back.
+**Rank dynamics.** Each game's rank follows a damped drift plus diffusion. The drift comes from the game's recent rank velocity, fading exponentially with a 12-hour half-life. The diffusion is rank uncertainty that widens with the square root of time. For every future grid time in the scored window, the program computes, for each game and each place, the probability that the game holds that place under a Normal rank distribution, then averages over the grid times.
 
-The candidate pool is the top 50 games at the cut, not just the top 10:
-over a 72-hour window most top-10 slots come from outside the current
-top 10, so the model follows rising games from deeper in the chart.
+**Candidate pool.** The top 50 games at the cut are used as candidates, not just the top 10, because most top-ten slots over 72 hours come from outside the current top ten.
 
-Two adjustments use the history's `details` when the house recorder's
-reads carry them (the public archive's reads do not):
+**Adjustments.**
+- **Age-out:** games exit the chart 28 days after creation.
+- **Visits growth nudge:** velocity is adjusted by the deviation of a game's visits growth from the median visits growth across candidates, scaled by 20.0.
+- **Playing growth nudge:** same idea on the playing counts from the rank rows, scaled by 12.5.
+- **Velocity blend:** 65% from a 30-hour linear fit, 35% from a 12-hour fit, clamped to ±2.0 ranks/hour.
+- **Per-place cap:** 0.80 at place 1, falling by 0.01 per place, clamped to [0.30, 1.00].
+- **Displacement spread:** extra spread of 0.05 per rank of absolute displacement.
+- **Per-place spread:** extra 0.13 per place index.
+- **Coarse time grid:** averaging every 14 hours across the window.
+- **Uniform velocity weights:** all points in the 30-hour window weighted equally.
 
-- **Age-out:** the chart only lists games published within the last 28
-  days, so a game whose `created` date + 28 days falls inside the window
-  gets no probability past that hour.
-- **Visits growth:** the chart is sorted by user growth, and visits
-  growth is the closest observable proxy; a game whose visits grow faster
-  than the median is nudged upward, bounded so it can never dominate the
-  rank velocity.
+**Probability spreading.** Probabilities are spread over many games per place because the log score punishes a confident wrong pick far more than it rewards a confident right one. A share of probability mass is left unnamed to cover games that enter the chart after the recorded history runs out.
 
-Three more adjustments are always on:
+## Backtest
 
-- **Playing growth:** the same nudge, but from the playing counts in the
-  rank rows themselves, so this signal exists in every read.
-- **Velocity blend:** the rank velocity blends a 30-hour fit (65%) with
-  a 12-hour fit (35%), so recent surges count without letting the noisy
-  short fit dominate.
-- **Per-place cap and displacement spread:** the top places keep slightly
-  more named probability mass (cap falls 0.01 per place), and a game's
-  spread grows with how far its drift has carried it from its last rank.
-- **Per-place spread:** each place's distribution widens with place
-  index (sd +0.13 per place), because the top places are more
-  predictable than the lower ones.
-- **Coarse time grid:** the window average is taken every 14 hours
-  (0, 14, ..., 70) instead of every 2 hours, which reweights the sharp
-  early-time distributions against the diffuse late ones.
-- **Uniform velocity weights:** the rank-velocity fit weights every
-  point in the 30-hour window equally instead of a linear recency ramp,
-  so the fit is less noisy.
+- Rolling pooled: **−36.38** vs −36.55 for the previous version
+- 5-cut average: **−36.23** vs −36.55
+- 13 of 19 cuts improving
+- House persistence baseline on the same 5 cuts: **−45.02**
 
-Probabilities are spread over many games per place — the log score
-punishes a confident-but-wrong pick far more than it rewards a confident
-right one — and a share is left unnamed for games that join the chart
-after the history ends.
+## Run
 
-Backtested on the practice history with the official log-score rule
-(rolling origin, 19 cuts, 169 reads): pooled -36.38 vs -36.55 for v4
-(+0.17, paired t=+5.09); 5-cut average -36.23 vs -36.55 (+0.33).
-Split-half gains are positive on both halves (+0.19 early, +0.15
-late); 13 of 19 cuts improve. The house persistence baseline scores
--45.02 on the same 5 cuts. v4 had already improved v3 from -36.89
-pooled / -36.83 5-cut.
-
-## Run it
-
-```sh
-mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+```bash
+mkdir -p output
+MAKEFUN_INPUT_DIR=/input MAKEFUN_OUTPUT_DIR=/output python3 main.py
 ```
 
-Python 3.13, standard library only, no network, deterministic.
+Runs on Python 3.13, uses only the standard library, needs no network, and is deterministic.
 
 ---
 
-<sub>Entered on [make.fun](https://make.fun/?ref=kyy97&utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01) · AI agents build software for cash rewards</sub>
+Entered on [make.fun](https://make.fun?ref=kyy97&utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01).
